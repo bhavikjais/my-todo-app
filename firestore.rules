@@ -1,0 +1,67 @@
+rules_version = '2';
+// Access model
+//   Private task        -> only the owner can read or write it (members list is forced empty).
+//   Shared-via-link     -> any signed-in person who has the link (the unguessable task id) can read it,
+//                          add it to their tasks (join), and update progress: status, subtasks, activity.
+//                          Only the owner can edit title/details, change visibility, or delete.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+
+    match /users/{userId} {
+      allow read, write: if signedIn() && me() == userId;
+    }
+
+    match /tasks/{taskId} {
+      function isOwner() { return signedIn() && resource.data.owner == me(); }
+      function isLink() { return resource.data.visibility == 'link'; }
+      function isMember() { return signedIn() && me() in resource.data.members; }
+      function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+      function added() { return request.resource.data.members.removeAll(resource.data.members); }
+      function removed() { return resource.data.members.removeAll(request.resource.data.members); }
+      // private tasks can never have members
+      function validShape(d) {
+        return d.visibility in ['private', 'link'] && d.members is list
+          && (d.visibility == 'link' || d.members.size() == 0)
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 200;
+      }
+
+      allow get: if isOwner() || isMember() || (signedIn() && isLink());
+      allow list: if isOwner() || isMember();
+
+      allow create: if signedIn()
+        && request.resource.data.owner == me()
+        && request.resource.data.members.size() == 0
+        && validShape(request.resource.data);
+
+      allow update: if validShape(request.resource.data) && (
+        // owner can change anything except ownership
+        (isOwner() && request.resource.data.owner == resource.data.owner)
+        // collaborator updating progress (may also leave = remove only themself)
+        || (isLink() && isMember()
+            && changed().hasOnly(['status', 'subtasks', 'activity', 'updatedAt', 'members', 'memberInfo'])
+            && added().size() == 0
+            && removed().hasOnly([me()]))
+        // someone with the link adding the task to their list (join = add only themself)
+        || (signedIn() && isLink() && !isMember()
+            && changed().hasOnly(['members', 'memberInfo', 'activity', 'updatedAt'])
+            && added() == [me()]
+            && removed().size() == 0)
+      );
+
+      allow delete: if isOwner();
+
+      match /attachments/{attId} {
+        function task() { return get(/databases/$(database)/documents/tasks/$(taskId)).data; }
+        function canSee() { return signedIn() && (task().owner == me() || task().visibility == 'link'); }
+        function canEdit() { return signedIn() && (task().owner == me() || (task().visibility == 'link' && me() in task().members)); }
+
+        allow read: if canSee();
+        allow create: if canEdit() && request.resource.data.by == me()
+          && request.resource.data.data is string && request.resource.data.data.size() < 900000;
+        allow delete: if signedIn() && (task().owner == me() || resource.data.by == me());
+      }
+    }
+  }
+}
